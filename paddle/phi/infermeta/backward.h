@@ -500,4 +500,9 @@ void SetValueGradInferMeta(const MetaTensor& out_grad,
                            MetaTensor* x_grad,
                            MetaTensor* value_grad);
 
+void LookupTableGradInferMeta(const MetaTensor& w,
+                              const MetaTensor& ids,
+                              const MetaTensor& out_grad,
+                              MetaTensor* w_grad);
+
 }  // namespace phi

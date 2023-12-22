@@ -3465,6 +3465,13 @@
   outputs:
     {out: Out}
 
+- op: lookup_table
+  backward: lookup_table_grad
+  inputs:
+    {w : W, ids : Ids}
+  outputs:
+    out : Out
+
 - op: lu
   backward: lu_grad
   inputs:

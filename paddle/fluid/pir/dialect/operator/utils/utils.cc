@@ -56,7 +56,9 @@ const std::unordered_set<std::string> LegacyOpList = {
     RowConvOp::name(),
     RowConvGradOp::name(),
     SoftReluOp::name(),
-    SoftReluGradOp::name()};
+    SoftReluGradOp::name(),
+    LookupTableOp::name(),
+    LookupTableGradOp::name()};
 
 enum class AttrType {
   UNDEFINED = 0,

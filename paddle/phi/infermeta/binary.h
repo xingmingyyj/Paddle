@@ -531,4 +531,10 @@ void WeightDequantizeInferMeta(const MetaTensor& x,
                                DataType out_dtype,
                                MetaTensor* out);
 
+void LookupTableInferMeta(const MetaTensor& w,
+                          const MetaTensor& ids,
+                          MetaTensor* out
+
+);
+
 }  // namespace phi

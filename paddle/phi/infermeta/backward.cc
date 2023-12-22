@@ -1298,4 +1298,12 @@ void SetValueGradInferMeta(const MetaTensor& out_grad,
   }
 }
 
+void LookupTableGradInferMeta(const MetaTensor& w,
+                              const MetaTensor& ids,
+                              const MetaTensor& out_grad,
+                              MetaTensor* w_grad) {
+  auto table_dims = w.dims();
+  w_grad->set_dims(table_dims);
+}
+
 }  // namespace phi
