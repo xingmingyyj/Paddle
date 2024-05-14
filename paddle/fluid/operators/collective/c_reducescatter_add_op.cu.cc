@@ -130,7 +130,7 @@ class CReduceScatterAddOpCUDAKernel : public framework::OpKernel<T> {
 
       PADDLE_ENFORCE_GPU_SUCCESS(phi::dynload::ncclReduceScatterAdd(
           static_cast<const void*>(send_buff),
-          static_cast<void*>(const_cast<float*>(add_buff)),
+          static_cast<void*>(recv_buff)),
           const_cast<void*>(add_buff),
           static_cast<size_t>(recv_numel),
           static_cast<ncclDataType_t>(dtype),
