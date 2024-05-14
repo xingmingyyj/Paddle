@@ -160,9 +160,9 @@ void NCCLCommContext::ReduceScatterAdd(phi::DenseTensor* out_tensor,
                                                    nccl_comm_);
   }
   NCCL_CHECK(phi::dynload::ncclReduceScatterAdd(
-      static_cast<const void*>(in_tensor.data()),
-      static_cast<void*>(out_tensor->data()),
-      const_cast<void*>(bias_tensor.data()),
+      in_tensor.data(),
+      out_tensor->data(),
+      bias_tensor.data(),
       static_cast<size_t>(out_tensor->numel()),
       ToNCCLDataType(in_tensor.type()),
       reduce_type,
