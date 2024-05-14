@@ -109,15 +109,34 @@ class CReduceScatterAddOpCUDAKernel : public framework::OpKernel<T> {
     if (comm_ctx) {
       comm_ctx->ReduceScatterAdd(out, *in, *bias, ncclSum, stream);
     } else {
-      PADDLE_ENFORCE_GPU_SUCCESS(
-          phi::dynload::ncclReduceScatterAdd(send_buff,
-                                             recv_buff,
-                                             add_buff,
-                                             recv_numel,
-                                             static_cast<ncclDataType_t>(dtype),
-                                             ncclSum,
-                                             comm->comm(),
-                                             stream));
+      /*
+       * Reduce-Scatter-Add
+       *
+       * Reduces data in sendbuff using op operation and leaves reduced result
+       * scattered over the devices so that recvbuff on rank i will contain the
+       * i-th block of the result. Add after the Scatter operation is completed,
+       * each device will perform some additional addition operations on the
+       * data it receives. Assumes sendcount is equal to nranks*recvcount, which
+       * means that sendbuff should have a size of at least nranks*recvcount
+       * elements.
+       *
+       * In-place operations will happen if recvbuff == sendbuff + rank *
+       * recvcount.
+       */
+      //  ncclResult_t  ncclReduceScatterAdd(const void* sendbuff, void*
+      //  recvbuff, void* addbuff,
+      //      size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op,
+      //      ncclComm_t comm, cudaStream_t stream);
+
+      PADDLE_ENFORCE_GPU_SUCCESS(phi::dynload::ncclReduceScatterAdd(
+          static_cast<const void*>(send_buff),
+          static_cast<void*>(recv_buff),
+          static_cast<void*>(add_buff),
+          static_cast<size_t>(recv_numel),
+          static_cast<ncclDataType_t>(dtype),
+          ncclSum,
+          comm->comm(),
+          stream));
     }
 #else
     PADDLE_THROW(phi::errors::PreconditionNotMet(
