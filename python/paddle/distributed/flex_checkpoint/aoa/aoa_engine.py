@@ -351,11 +351,11 @@ class AOAEngine:
                 for i in range(ndim):
                     dst = sl_dst[i]
                     src = sl_src[i]
-                    dim_len = tensor.shape[i]
-                    dst_start, _, _ = dst.indices(dim_len)
-                    src_start, _, _ = src.indices(dim_len)
-                    inter_start, inter_stop, _ = intersection[i].indices(
-                        dim_len
+                    dst_start = dst.start
+                    src_start = src.start
+                    inter_start, inter_stop = (
+                        intersection[i].start,
+                        intersection[i].stop,
                     )
                     offset = inter_start - dst_start
                     src_inter_start = src_start + offset
