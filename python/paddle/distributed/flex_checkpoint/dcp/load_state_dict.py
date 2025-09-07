@@ -18,7 +18,7 @@ import copy
 import json
 import math
 import os
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -59,13 +59,32 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class ReadItem:
-    local_tensor_index: LocalTensorIndex
-    rank: int
+    """
+    Represents a read operation between distributed tensor partitions.
+
+    Attributes:
+        tensor_name (str): Name of the tensor.
+        src_global_offset (tuple[int]): Global offset in the source tensor.
+        dst_global_offset (tuple[int] | None): Global offset in the destination tensor.
+        dst_rank (int): Destination rank (device or process ID).
+        src_rank (int): Source rank (device or process ID).
+        dst_local_offset (tuple[int]): Local offset in the destination tensor partition.
+        src_local_offset (tuple[int]): Local offset in the source tensor partition.
+        slice_shape (tuple[int]): Shape of the slice to transfer.
+        file_name (str): The name of the file from which the source tensor is read on the source rank.
+        dtype (str): Data type of the tensor.
+    """
+
+    tensor_name: str
+    src_global_offset: tuple[int]
+    dst_global_offset: tuple[int] | None
+    dst_rank: int
+    src_rank: int
+    dst_local_offset: tuple[int]
+    src_local_offset: tuple[int]
+    slice_shape: tuple[int]
+    file_name: str
     dtype: str
-    cur_offset: tuple[int]
-    storage_offset: tuple[int]
-    lengths: tuple[int]
-    global_offset: tuple[int, ...] | None
 
 
 PATH_TO_CHECKPOINT_FILES: dict[str, tuple[list, list]] = {}
@@ -162,7 +181,7 @@ def get_rank_to_files(
     for files in global_data_files:
         tmp += files
     global_data_files_set = set(tmp)
-    logger.debug(
+    logger.info(
         f"necessary_data_files_set:{global_necessary_files_set}, global_data_files_set:{global_data_files_set}"
     )
     # check necessary files in global_data_files
@@ -194,7 +213,7 @@ def get_rank_to_files(
             f for f in need_files if not (f in seen or seen.add(f))
         ]
         rank_to_files[rank] = unique_need_files
-    logger.debug(f"mapping rank_to_files:{rank_to_files}")
+    logger.info(f"mapping rank_to_files:{rank_to_files}")
     return rank_to_files, missing_keys, mw_name_compatibility_mapping
 
 
@@ -329,7 +348,7 @@ def _get_rank_to_read_files(rank_to_files):
             if len(rank_to_not_read_files[rank]) == 0:
                 rank_to_not_read_files.pop(rank)
 
-    logger.debug(
+    logger.info(
         f"rank_to_read_files:{rank_to_read_files}, rank_to_not_read_files:{rank_to_not_read_files}"
     )
 
@@ -374,7 +393,7 @@ def _get_rank_to_read_files(rank_to_files):
                 if f not in file_to_ranks:
                     file_to_ranks[f] = []
                 file_to_ranks[f].append(r)
-        logger.debug(f"file_to_ranks:{file_to_ranks}")
+        logger.info(f"file_to_ranks:{file_to_ranks}")
         if file in file_to_ranks:
             for r in file_to_ranks[file]:
                 rank_to_not_read_files[r].remove(file)
@@ -385,7 +404,7 @@ def _get_rank_to_read_files(rank_to_files):
         ranks = get_least_read_files_ranks(rank_to_read_files)
         rank_file = get_read_rank_file(rank_to_not_read_files, ranks)
         update(rank_to_read_files, rank_to_not_read_files, rank_file)
-        logger.debug(
+        logger.info(
             f"update rank_to_read_files:{rank_to_read_files}, rank_to_not_read_files:{rank_to_not_read_files}, ranks:{ranks}, rank_file:{rank_file}"
         )
     return rank_to_read_files
@@ -393,14 +412,14 @@ def _get_rank_to_read_files(rank_to_files):
 
 def get_load_infos(metadata_list, local_load_files, process_group, use_dist):
     load_info = {}
+    cur_rank = paddle.distributed.get_rank()
     for metadata in metadata_list:
         for local_tensor_index, file_name in metadata.storage_metadata.items():
             if file_name in local_load_files:
                 load_info[local_tensor_index] = (
-                    paddle.distributed.get_rank(),
+                    cur_rank,
                     file_name,
                 )
-
     load_info_list = []
     if use_dist:
         paddle.distributed.all_gather_object(
@@ -466,7 +485,9 @@ def not_overlap(
     return False
 
 
-def get_read_items(metadata_list, state_dict, process_group, use_dist):
+def get_read_items(
+    metadata_list, state_dict, process_group, use_dist, load_infos
+):
     storage_state_dict_metadata = {}
     for metadata in metadata_list:
         for (
@@ -479,7 +500,7 @@ def get_read_items(metadata_list, state_dict, process_group, use_dist):
 
     read_items = []
     global_shape = None
-    logger.debug(f"storage_state_dict_metadata:{storage_state_dict_metadata}")
+    # logger.info(f"storage_state_dict_metadata:{storage_state_dict_metadata}")
     for tensor_key, val in state_dict.items():
         tensor_name = None
         if isinstance(val, paddle.Tensor):
@@ -527,7 +548,7 @@ def get_read_items(metadata_list, state_dict, process_group, use_dist):
             global_offset, local_shape, dtype, global_shape
         )
         assert tensor_name in storage_state_dict_metadata, (
-            f"tensor_key:{tensor_key} not found in storage_state_dict_metadata:{storage_state_dict_metadata}."
+            f"tensor_key:{tensor_name} not found in storage_state_dict_metadata:{storage_state_dict_metadata}."
         )
 
         for storage_local_tensor_metadata in storage_state_dict_metadata[
@@ -542,16 +563,22 @@ def get_read_items(metadata_list, state_dict, process_group, use_dist):
                 tensor_name,
                 tuple(storage_local_tensor_metadata.global_offset),
             )
+            src_rank, file_name = load_infos[storage_local_tensor_index]
             read_items.append(
                 ReadItem(
-                    storage_local_tensor_index,
-                    paddle.distributed.get_rank(),
-                    storage_local_tensor_metadata.dtype,
-                    tuple(cur_offsets),
-                    tuple(storage_offsets),
-                    tuple(lengths),
-                    global_offset,
-                )
+                    tensor_name=tensor_name,
+                    src_global_offset=tuple(
+                        storage_local_tensor_metadata.global_offset
+                    ),
+                    dst_global_offset=global_offset,
+                    dst_rank=paddle.distributed.get_rank(),
+                    src_rank=src_rank,
+                    dst_local_offset=tuple(cur_offsets),
+                    src_local_offset=tuple(storage_offsets),
+                    slice_shape=tuple(lengths),
+                    file_name=file_name,
+                    dtype=storage_local_tensor_metadata.dtype,
+                ),
             )
 
     global_read_items = []
@@ -958,7 +985,9 @@ def load_state_dict_impl(
                     safetensors=safetensors,
                 )
                 source_state_dict[file] = {
-                    key: paddle.to_tensor(value, place=paddle.CPUPlace())
+                    key: paddle.to_tensor(
+                        value, place=paddle.CPUPlace()
+                    ).pin_memory()
                     for key, value in state_dict_numpy.items()
                 }
             else:
@@ -987,7 +1016,393 @@ def load_state_dict_impl(
             tmp[keys[-1]] = flat_state_dict[flat_key]
 
 
+# def schedule_read_items(read_items: list) -> (list, list):
+#     """
+#     Schedule communication ReadItems into rounds.
+#     In each round, each rank can:
+#       - send to at most one other rank,
+#       - receive from at most one other rank,
+#     but may send and receive at the same time.
+#     Local copy tasks (src_rank == dst_rank) are separated out.
+
+#     Returns:
+#         rounds: List of rounds, each round is a list of communication ReadItems.
+#         local_tasks: List of local copy ReadItems.
+#     """
+#     # Separate local copy tasks
+#     local_tasks = [item for item in read_items if item.src_rank == item.dst_rank]
+#     comm_tasks = [item for item in read_items if item.src_rank != item.dst_rank]
+
+#     pending = set(comm_tasks)
+#     rounds = []
+#     while pending:
+#         send_to = dict()
+#         recv_from = dict()
+#         current_round = []
+#         for item in list(pending):
+#             src = item.src_rank
+#             dst = item.dst_rank
+#             if (src not in send_to) and (dst not in recv_from):
+#                 send_to[src] = dst
+#                 recv_from[dst] = src
+#                 current_round.append(item)
+#                 pending.remove(item)
+#         rounds.append(current_round)
+#     return rounds, local_tasks
+
+
+def schedule_read_items(read_items: list):
+    """
+    Schedule communication ReadItems into rounds.
+    In each round, each rank can:
+      - either send to at most one other rank OR receive from at most one other rank (not both),
+    but may send/receive at the same time across different ranks.
+    Local copy tasks (src_rank == dst_rank) are separated out.
+
+    Returns:
+        rounds: List of rounds, each round is a list of communication ReadItems.
+        local_tasks: List of local copy ReadItems.
+    """
+    # Separate local copy tasks
+    local_tasks = [
+        item for item in read_items if item.src_rank == item.dst_rank
+    ]
+    comm_tasks = [item for item in read_items if item.src_rank != item.dst_rank]
+
+    pending = comm_tasks
+    rounds = []
+    while pending:
+        participated = (
+            set()
+        )  # ranks that have participated (either as sender or receiver)
+        current_round = []
+        for item in list(pending):
+            src = item.src_rank
+            dst = item.dst_rank
+            # Only schedule if neither src nor dst has participated in this round
+            if src not in participated and dst not in participated:
+                participated.add(src)
+                participated.add(dst)
+                current_round.append(item)
+                pending.remove(item)
+        rounds.append(current_round)
+    return rounds, local_tasks
+
+
+def get_target_tensor(target_state_dict, read_item):
+    if any(isinstance(k, tuple) for k in target_state_dict):
+        key = (read_item.tensor_name, read_item.dst_global_offset)
+    else:
+        key = read_item.tensor_name
+    return target_state_dict[key]
+
+
+def slice_tensor(tensor, slice_begin, slice_shape):
+    slice_end = [
+        start + length for start, length in zip(slice_begin, slice_shape)
+    ]
+    axes = list(range(tensor.ndim))
+    return paddle.slice(tensor, axes=axes, starts=slice_begin, ends=slice_end)
+
+
+def prepare_buffers(
+    tasks,
+    cur_rank,
+    source_state_dict,
+    target_state_dict,
+    send_buffers,
+    recv_buffers,
+):
+    """
+    Prepare send_buffers and recv_buffers for the current step.
+    """
+    logger.info(
+        f"Preparing buffers for rank {cur_rank} with {len(tasks)} tasks."
+    )
+    for task in tasks:
+        if task.dst_rank != cur_rank and task.src_rank != cur_rank:
+            continue
+        if task.src_rank == cur_rank:
+            src_tensor = source_state_dict[task.file_name][task.tensor_name]
+            src_chunk_tensor = slice_tensor(
+                src_tensor, task.src_local_offset, task.slice_shape
+            )
+            src_chunk_tensor = src_chunk_tensor.contiguous()
+            if src_chunk_tensor.place.is_cpu_place():
+                send_buffers.append(src_chunk_tensor.cuda())
+                logger.info(
+                    f"Rank {cur_rank} send buffer prepared on CUDA for task {task}."
+                )
+            else:
+                send_buffers.append(src_chunk_tensor)
+                logger.info(
+                    f"Rank {cur_rank} send buffer prepared on original device for task {task}."
+                )
+        if task.dst_rank == cur_rank:
+            dst_tensor = get_target_tensor(target_state_dict, task)
+            dst_chunk_tensor = slice_tensor(
+                dst_tensor, task.dst_local_offset, task.slice_shape
+            )
+            dst_chunk_tensor = dst_chunk_tensor.contiguous()
+            if dst_chunk_tensor.place.is_cpu_place():
+                tmp = dst_chunk_tensor.cuda()
+                tmp.need_move_to_cpu = True
+                tmp.is_wrote = False
+                tmp.origin_slice = dst_chunk_tensor
+                recv_buffers.append(tmp)
+                logger.info(
+                    f"Rank {cur_rank} recv buffer prepared on CUDA for task {task}."
+                )
+            else:
+                tmp = dst_chunk_tensor
+                tmp.origin_slice = dst_chunk_tensor
+                tmp.is_wrote = False
+                recv_buffers.append(tmp)
+                logger.info(
+                    f"Rank {cur_rank} recv buffer prepared on original device for task {task}."
+                )
+
+
+def comm_send_recv(tasks, cur_rank, send_buffers, recv_buffers):
+    """
+    Launch isend/irecv operations for the current step.
+    """
+    # groups = init_tmp_comm_groups(tasks)
+    send_task, recv_task = None, None
+    send_buffer = None
+    recv_buffer = None
+    group = None
+    for task in tasks:
+        if task.dst_rank != cur_rank and task.src_rank != cur_rank:
+            continue
+        if task.dst_rank == cur_rank:
+            recv_buffer = recv_buffers[-1]
+            recv_task = paddle.distributed.stream.recv(
+                recv_buffer, group=None, src=task.src_rank, sync_op=False
+            )
+        elif task.src_rank == cur_rank:
+            send_buffer = send_buffers.popleft()
+            send_task = paddle.distributed.stream.send(
+                send_buffer, group=None, dst=task.dst_rank, sync_op=False
+            )
+    return send_task, recv_task, send_buffer, recv_buffer
+
+
+def handle_post_recv(recv_buffers):
+    """
+    Handle recv_buffers that need to be moved back to CPU.
+    """
+    if not recv_buffers:
+        return
+    recv_buffer = recv_buffers[0]
+    assert hasattr(recv_buffer, 'is_wrote')
+    if not recv_buffer.is_wrote:
+        return
+    else:
+        recv_buffers.popleft()
+    if hasattr(recv_buffer, 'need_move_to_cpu'):
+        dst_chunk_tensor = recv_buffer.origin_slice
+        paddle.assign(recv_buffer.cpu(), dst_chunk_tensor)
+        logger.info(
+            "Moved received buffer back to CPU and assigned to destination tensor."
+        )
+    else:
+        dst_chunk_tensor = recv_buffer.origin_slice
+        paddle.assign(recv_buffer, dst_chunk_tensor)
+    del recv_buffer
+
+
+def local_copy_tasks(
+    local_tasks, cur_rank, source_state_dict, target_state_dict
+):
+    """
+    Complete local copy tasks.
+    """
+    logger.info(
+        f"Rank {cur_rank} starting local copy for {len(local_tasks)} tasks."
+    )
+    for task in local_tasks:
+        if task.src_rank != cur_rank:
+            continue
+
+        src_tensor = source_state_dict[task.file_name][task.tensor_name]
+        dst_tensor = get_target_tensor(target_state_dict, task)
+
+        src_chunk_tensor = slice_tensor(
+            src_tensor, task.src_local_offset, task.slice_shape
+        )
+        src_chunk_tensor = src_chunk_tensor.contiguous()
+        dst_chunk_tensor = slice_tensor(
+            dst_tensor, task.dst_local_offset, task.slice_shape
+        )
+        if src_chunk_tensor.place == dst_chunk_tensor.place:
+            paddle.assign(src_chunk_tensor, dst_chunk_tensor)
+            logger.info(f"Local copy (same device) for task {task}.")
+        else:
+            tmp = (
+                src_chunk_tensor.cuda()
+                if dst_chunk_tensor.place.is_gpu_place()
+                else src_chunk_tensor.cpu()
+            )
+            paddle.assign(tmp, dst_chunk_tensor)
+            del tmp
+            logger.info(f"Local copy (cross device) for task {task}.")
+        del src_tensor
+        del src_chunk_tensor
+
+
 def _load_state_dict(
+    target_state_dict: dict,
+    source_state_dict: dict,
+    metadata_list,
+    process_group=None,
+    coordinator_rank=0,
+    offload=False,
+):
+    use_dist = paddle.distributed.get_world_size() > 1
+    cur_rank = paddle.distributed.get_rank()
+
+    local_load_files = list(source_state_dict.keys())
+    logger.info(f"Rank {cur_rank} generating load and communication plan.")
+    load_infos = get_load_infos(
+        metadata_list, local_load_files, process_group, use_dist
+    )
+    logger.info(f"Rank {cur_rank} generating read items.")
+    read_items = get_read_items(
+        metadata_list, target_state_dict, process_group, use_dist, load_infos
+    )
+    logger.info(f"Rank {cur_rank} begin scheduling.")
+    comm_rounds, local_tasks = schedule_read_items(read_items)
+    processed_target_state_dict = {
+        k: v.local_tensor if isinstance(v, ShardedWeight) else v
+        for k, v in target_state_dict.items()
+    }
+    has_tuple_key = any(
+        isinstance(k, tuple) for k in processed_target_state_dict
+    )
+    has_non_tuple_key = any(
+        not isinstance(k, tuple) for k in processed_target_state_dict
+    )
+    assert not (has_tuple_key and has_non_tuple_key), (
+        "target_state_dict contains a mix of tuple and non-tuple keys. Please ensure key types are consistent."
+    )
+
+    if not use_dist:
+        assert len(comm_rounds) == 0, (
+            "No communication task is needed when not using distributed training."
+        )
+
+    # 4. Complete local copy tasks
+    local_copy_tasks(
+        local_tasks, cur_rank, source_state_dict, processed_target_state_dict
+    )
+
+    logger.info(
+        f"Rank {cur_rank} finished local copy and entered communication phase."
+    )
+
+    if len(comm_rounds) == 0:
+        return
+    paddle.distributed.barrier(process_group)
+
+    send_buffers = deque()
+    recv_buffers = deque()
+
+    all_steps = len(comm_rounds) + 2
+    for step in range(all_steps):
+        logger.info(
+            f"Rank {cur_rank} at communication step {step}/{all_steps - 1}."
+        )
+        if step == 0:
+            # Prepare buffers for the 1st communication round
+            prepare_buffers(
+                comm_rounds[0],
+                cur_rank,
+                source_state_dict,
+                processed_target_state_dict,
+                send_buffers,
+                recv_buffers,
+            )
+            paddle.distributed.barrier(process_group)
+
+        elif step == 1:
+            # 1st communication round
+            send_task, recv_task, send_buffer, recv_buffer = comm_send_recv(
+                comm_rounds[0], cur_rank, send_buffers, recv_buffers
+            )
+            if len(comm_rounds) > 1:
+                prepare_buffers(
+                    comm_rounds[1],
+                    cur_rank,
+                    source_state_dict,
+                    processed_target_state_dict,
+                    send_buffers,
+                    recv_buffers,
+                )
+            if send_task is not None:
+                send_task.wait()
+                del send_buffer
+            if recv_task is not None:
+                recv_task.wait()
+                recv_buffer.is_wrote = True
+            paddle.distributed.barrier(process_group)
+
+        elif step < len(comm_rounds):
+            # Other communication rounds
+            logger.info("begin launching comm_send_recv.")
+            send_task, recv_task, send_buffer, recv_buffer = comm_send_recv(
+                comm_rounds[step - 1], cur_rank, send_buffers, recv_buffers
+            )
+            logger.info("end launching comm_send_recv.")
+            logger.info("begin prepare_buffers.")
+            prepare_buffers(
+                comm_rounds[step],
+                cur_rank,
+                source_state_dict,
+                processed_target_state_dict,
+                send_buffers,
+                recv_buffers,
+            )
+            logger.info("end prepare_buffers.")
+            logger.info("begin handle_post_recv.")
+            handle_post_recv(recv_buffers)
+            logger.info("end handle_post_recv.")
+            if send_task is not None:
+                logger.info("begin waiting for sending.")
+                send_task.wait()
+                logger.info("end waiting for sending.")
+                del send_buffer
+            if recv_task is not None:
+                logger.info("begin waiting for recv.")
+                recv_task.wait()
+                recv_buffer.is_wrote = True
+                logger.info("end waiting for recv.")
+            paddle.distributed.barrier(process_group)
+
+        elif step == len(comm_rounds):
+            if len(comm_rounds):
+                send_task, recv_task, send_buffer, recv_buffer = comm_send_recv(
+                    comm_rounds[step - 1], cur_rank, send_buffers, recv_buffers
+                )
+                handle_post_recv(recv_buffers)
+                if send_task is not None:
+                    send_task.wait()
+                    del send_buffer
+                if recv_task is not None:
+                    recv_task.wait()
+                    recv_buffer.is_wrote = True
+            paddle.distributed.barrier(process_group)
+
+        else:
+            # Handle remaining recv buffers
+            handle_post_recv(recv_buffers)
+            paddle.distributed.barrier(process_group)
+
+    assert len(send_buffers) == 0 and len(recv_buffers) == 0
+    logger.info(f"Rank {cur_rank} finished distributed state dict loading.")
+
+
+def _load_state_dict2(
     target_state_dict: (
         dict[str, Tensor]
         | dict[str, ShardedWeight]
@@ -1042,7 +1457,7 @@ def _load_state_dict(
                 f"read item:{item}, load_infos:{load_infos}"
             )
 
-            logger.debug(f"read item: {item}")
+            logger.info(f"read item: {item}")
             src_rank, file_name = load_infos[item.local_tensor_index]
             storage_chunk_tensor = None
             cur_chunk_tensor = None
