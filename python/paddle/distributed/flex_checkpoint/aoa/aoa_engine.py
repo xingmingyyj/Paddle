@@ -154,9 +154,10 @@ class AOAShardInfoContext:
         }
 
         if not shard_nums:
-            raise ValueError(
-                f"No shard information found for any of the keys: {state_keys}"
+            logger.warning(
+                f"No shard information found for any of the keys: {state_keys}, return 1."
             )
+            return 1
 
         if len(shard_nums) > 1:
             raise AssertionError(
@@ -196,9 +197,10 @@ class AOAShardInfoContext:
         }
 
         if not shard_nums:
-            raise ValueError(
-                f"No shard information found for any of the keys: {state_keys}"
+            logger.warning(
+                f"No shard information found for any of the keys: {state_keys}, return 1."
             )
+            return 1
 
         if len(shard_nums) > 1:
             raise AssertionError(
