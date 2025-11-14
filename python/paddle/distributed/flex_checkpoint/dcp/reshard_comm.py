@@ -57,7 +57,7 @@ class SendRecvCommunicator(AbstractCommunicator):
     def communicate(self, comm_tasks, state, context):
         cur_rank = context['rank']
         process_group = context['process_group']
-        using_group = context['using_group']
+        use_group = context['use_group']
 
         source_state_dict = state['source_state_dict']
         target_state_dict = state['target_state_dict']
@@ -97,7 +97,7 @@ class SendRecvCommunicator(AbstractCommunicator):
                         if rank == cur_rank:
                             continue
                         send_t = source_tensor_slices[item]
-                        if using_group:
+                        if use_group:
                             send_op = dist.P2POp(dist.isend, send_t, rank)
                             send_recv_ops.append(send_op)
                         else:
@@ -106,13 +106,13 @@ class SendRecvCommunicator(AbstractCommunicator):
                     if item.src_rank == cur_rank:
                         continue
                     recv_t = target_tensor_slices[item]
-                    if using_group:
+                    if use_group:
                         recv_op = dist.P2POp(dist.irecv, recv_t, item.src_rank)
                         send_recv_ops.append(recv_op)
                     else:
                         dist.recv(recv_t, item.src_rank)
 
-        if using_group:
+        if use_group:
             logger.info("Starting to send/recv tensors using P2POp.")
             task_handles = dist.batch_isend_irecv(send_recv_ops)
             for task in task_handles:
