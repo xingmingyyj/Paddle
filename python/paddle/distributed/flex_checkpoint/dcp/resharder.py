@@ -87,7 +87,6 @@ def schedule_read_items(
         read_item.file_name,
         read_item.dtype,
     )
-    comm_read_items = sorted(comm_read_items, key=order_rules)
     # Step 1: Group by tensor_name
     tensor_groups = defaultdict(list)
     for item in comm_read_items:
@@ -215,18 +214,34 @@ def not_overlap(
     return False
 
 
+def build_storage_state_dict_metadata(metadata_list):
+    counts = {}
+    for md in metadata_list:
+        items = md.state_dict_metadata.items()
+        for k, lst in items:
+            counts[k] = counts.get(k, 0) + len(lst)
+
+    result = {k: [None] * n for k, n in counts.items()}
+    offset = dict.fromkeys(counts, 0)
+
+    for md in metadata_list:
+        items = md.state_dict_metadata.items()
+        for k, lst in items:
+            o = offset[k]
+            n = len(lst)
+            result[k][o : o + n] = lst
+            offset[k] = o + n
+
+    return result
+
+
 def get_read_items(
     metadata_list, state_dict, process_group, use_dist, load_infos
 ):
     storage_state_dict_metadata = {}
-    for metadata in metadata_list:
-        for (
-            tensor_key,
-            local_tensor_metadata,
-        ) in metadata.state_dict_metadata.items():
-            if tensor_key not in storage_state_dict_metadata:
-                storage_state_dict_metadata[tensor_key] = []
-            storage_state_dict_metadata[tensor_key] += local_tensor_metadata
+    storage_state_dict_metadata = build_storage_state_dict_metadata(
+        metadata_list
+    )
 
     read_items = []
     global_shape = None
