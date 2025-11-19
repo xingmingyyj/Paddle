@@ -397,6 +397,10 @@ class StateDictResharder:
     def reshard(self):
         cur_rank = paddle.distributed.get_rank()
         processed_target_state_dict, read_items = self.preprocess()
+
+        logger.info(
+            f"ReadItem generation completed, with a total of {len(read_items)}."
+        )
         comm_tasks = schedule_read_items(read_items)
         if not read_items:
             return processed_target_state_dict

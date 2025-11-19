@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import types
 from abc import ABC, abstractmethod
 
 import paddle
 import paddle.distributed as dist
 from paddle.distributed.fleet.utils.log_util import logger
+
+GROUPED_BATCH_SIZE = 2000
 
 
 class AbstractCommunicator(ABC):
@@ -26,26 +29,23 @@ class AbstractCommunicator(ABC):
 
 
 def get_target_tensor(target_state_dict, read_item):
-    use_dist = True if paddle.distributed.get_world_size() > 1 else False
+    use_dist = paddle.distributed.get_world_size() > 1
     if any(isinstance(k, tuple) for k in target_state_dict):
         key = (read_item.tensor_name, read_item.dst_global_offset)
     else:
         key = read_item.tensor_name
-    target_tensor = (
-        target_state_dict[key]._local_value()
-        if use_dist and target_state_dict[key].is_dist()
-        else target_state_dict[key]
-    )
-    return target_tensor
+
+    tensor = target_state_dict[key]
+    return tensor._local_value() if use_dist and tensor.is_dist() else tensor
 
 
 def slice_tensor(tensor, slice_begin, slice_shape):
-    # If slice_shape is empty, the tensor is 0-dimensional (scalar); return it as is.
-    if len(slice_shape) == 0:
-        assert len(tensor.shape) == 0, (
+    if not slice_shape:
+        assert not tensor.shape, (
             "Only 0-dimensional tensor supports empty slice_shape."
         )
         return tensor
+
     slice_end = [
         start + length for start, length in zip(slice_begin, slice_shape)
     ]
@@ -54,6 +54,12 @@ def slice_tensor(tensor, slice_begin, slice_shape):
 
 
 class SendRecvCommunicator(AbstractCommunicator):
+    """
+    Communicator that uses send/recv operations for data transfer.
+
+    The process is broken down into batches to manage memory and communication overhead.
+    """
+
     def communicate(self, comm_tasks, state, context):
         cur_rank = context['rank']
         process_group = context['process_group']
@@ -62,81 +68,138 @@ class SendRecvCommunicator(AbstractCommunicator):
         source_state_dict = state['source_state_dict']
         target_state_dict = state['target_state_dict']
 
-        source_tensor_slices = {}
-        target_tensor_slices = {}
-        local_copy_task = set()
+        self._clear_target_tensors_memory(target_state_dict)
+
+        all_received_slices = {}
+        total_items = sum(len(items) for items in comm_tasks.values())
+        processed_items = 0
+
+        for batch_data in self._process_batches(
+            comm_tasks, cur_rank, source_state_dict
+        ):
+            self._execute_p2p_ops(batch_data, cur_rank, use_group=use_group)
+
+            for item, tensor in batch_data.source_slices.items():
+                if item not in batch_data.local_copy_tasks:
+                    tensor._clear()
+
+            all_received_slices.update(batch_data.target_slices)
+
+            processed_items += len(batch_data.read_items)
+            progress = processed_items / total_items * 100
+            logger.info(
+                f"Batch communication completed. Progress: {processed_items}/{total_items} ({progress:.1f}%)."
+            )
+
+        self._assign_received_data(all_received_slices, target_state_dict)
+
+        if use_group:
+            paddle.distributed.barrier(process_group)
+        logger.info("All communication tasks completed successfully.")
+
+    def _clear_target_tensors_memory(self, target_state_dict):
+        for tensor in target_state_dict.values():
+            tensor._clear_to_zero_allocation()
+
+    def _process_batches(self, comm_tasks, cur_rank, source_state_dict):
+        total_items = sum(len(items) for items in comm_tasks.values())
+        item_count = 0
+
+        batch_read_items = []
+        batch_source_slices = {}
+        batch_target_slices = {}
+        batch_local_copy_tasks = set()
+
         for tensor_name, read_items in comm_tasks.items():
-            need_clear = set()
+            tensors_to_clear = set()
             for item in read_items:
+                item_count += 1
+                batch_read_items.append(item)
                 if cur_rank == item.src_rank:
                     src_tensor = source_state_dict[item.file_name][
                         item.tensor_name
                     ]
-                    src_chunk_tensor = slice_tensor(
-                        src_tensor, item.src_local_offset, item.slice_shape
-                    ).clone()
-                    source_tensor_slices[item] = src_chunk_tensor.contiguous()
-                    need_clear.add(src_tensor)
+                    src_slice = (
+                        slice_tensor(
+                            src_tensor, item.src_local_offset, item.slice_shape
+                        )
+                        .cuda()
+                        .clone()
+                    )
+                    batch_source_slices[item] = src_slice
+                    tensors_to_clear.add(src_tensor)
                 if cur_rank in item.dst_rank:
                     if cur_rank == item.src_rank:
-                        local_copy_task.add(item)
-                        target_tensor_slices[item] = source_tensor_slices[item]
+                        batch_local_copy_tasks.add(item)
+                        batch_target_slices[item] = batch_source_slices[item]
                     else:
-                        dst_chunk_tensor = paddle.zeros(
+                        dst_slice = paddle.zeros(
                             item.slice_shape, dtype=item.dtype
                         )
-                        target_tensor_slices[item] = dst_chunk_tensor
-            for tensor in need_clear:
+                        batch_target_slices[item] = dst_slice
+
+                if (len(batch_read_items) % GROUPED_BATCH_SIZE == 0) or (
+                    item_count == total_items
+                ):
+                    batch_data = types.SimpleNamespace(
+                        read_items=batch_read_items,
+                        source_slices=batch_source_slices,
+                        target_slices=batch_target_slices,
+                        local_copy_tasks=batch_local_copy_tasks,
+                    )
+                    yield batch_data
+                    batch_read_items = []
+                    batch_source_slices = {}
+                    batch_target_slices = {}
+                    batch_local_copy_tasks = set()
+
+            for tensor in tensors_to_clear:
                 tensor._clear_to_zero_allocation()
 
-        send_recv_ops = []
-        for tensor_name, read_items in comm_tasks.items():
-            for item in read_items:
-                if item.src_rank == cur_rank:
-                    for rank in item.dst_rank:
-                        if rank == cur_rank:
-                            continue
-                        send_t = source_tensor_slices[item]
+    def _execute_p2p_ops(self, batch_data, cur_rank, use_group):
+        p2p_ops = []
+        for item in batch_data.read_items:
+            if item.src_rank == cur_rank:
+                for rank in item.dst_rank:
+                    if rank != cur_rank:
+                        send_tensor = batch_data.source_slices[item]
                         if use_group:
-                            send_op = dist.P2POp(dist.isend, send_t, rank)
-                            send_recv_ops.append(send_op)
+                            p2p_ops.append(
+                                dist.P2POp(dist.isend, send_tensor, rank)
+                            )
                         else:
-                            dist.send(send_t, rank)
-                if cur_rank in item.dst_rank:
-                    if item.src_rank == cur_rank:
-                        continue
-                    recv_t = target_tensor_slices[item]
-                    if use_group:
-                        recv_op = dist.P2POp(dist.irecv, recv_t, item.src_rank)
-                        send_recv_ops.append(recv_op)
-                    else:
-                        dist.recv(recv_t, item.src_rank)
+                            dist.send(send_tensor, rank)
 
-        if use_group:
-            logger.info("Starting to send/recv tensors using P2POp.")
-            task_handles = dist.batch_isend_irecv(send_recv_ops)
-            for task in task_handles:
-                task.wait()
-            logger.info("Send/Recv tensors finished.")
+            if cur_rank in item.dst_rank and item.src_rank != cur_rank:
+                recv_tensor = batch_data.target_slices[item]
+                if use_group:
+                    p2p_ops.append(
+                        dist.P2POp(dist.irecv, recv_tensor, item.src_rank)
+                    )
+                else:
+                    dist.recv(recv_tensor, item.src_rank)
 
-        for item in source_tensor_slices:
-            if item not in local_copy_task:
-                source_tensor_slices[item]._clear()
-
-        del source_tensor_slices
-
-        for item in target_tensor_slices:
-            dst_tensor = get_target_tensor(target_state_dict, item)
-            if not dst_tensor._is_initialized():
-                buffer = paddle.zeros_like(dst_tensor)
-                buffer._share_buffer_to(dst_tensor)
-            dst_chunk_tensor = slice_tensor(
-                dst_tensor, item.dst_local_offset, item.slice_shape
+        if use_group and p2p_ops:
+            logger.info(
+                f"Starting batched send/recv for {len(p2p_ops)} P2P operations."
             )
-            cur_chunk_tensor = target_tensor_slices[item]
-            if dst_chunk_tensor.place != cur_chunk_tensor.place:
-                cur_chunk_tensor = cur_chunk_tensor.to(dst_chunk_tensor.place)
-            paddle.assign(cur_chunk_tensor, dst_chunk_tensor)
+            reqs = dist.batch_isend_irecv(p2p_ops)
+            for req in reqs:
+                req.wait()
+            logger.info("Batched send/recv finished.")
 
-        paddle.distributed.barrier(process_group)
-        logger.info("All communication tasks completed.")
+    def _assign_received_data(self, all_received_slices, target_state_dict):
+        for item, received_slice in all_received_slices.items():
+            dest_tensor = get_target_tensor(target_state_dict, item)
+            if not dest_tensor._is_initialized():
+                buffer = paddle.zeros_like(dest_tensor)
+                buffer._share_buffer_to(dest_tensor)
+
+            dest_slice = slice_tensor(
+                dest_tensor, item.dst_local_offset, item.slice_shape
+            )
+
+            if dest_slice.place != received_slice.place:
+                received_slice = received_slice.to(dest_slice.place)
+
+            paddle.assign(received_slice, dest_slice)

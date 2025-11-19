@@ -55,10 +55,6 @@ from paddle.distributed.flex_checkpoint.dcp.sharded_weight import (
     ShardedStateDict,
     build_sharded_state_dict,
 )
-
-if TYPE_CHECKING:
-    from paddle.distributed.communication.group import Group
-
 from paddle.framework import ParamAttr
 from paddle.profiler.utils import in_profiler_mode
 from paddle.utils import deprecated
@@ -2318,7 +2314,7 @@ class Layer:
     def full(
         self,
         aoa_config: dict[str : list[str]] | None = None,
-        process_group: Group | None = None,
+        **kwargs,
     ):
         """
         Returns an iterator over the full, unsharded model parameters.
@@ -2338,11 +2334,11 @@ class Layer:
                 An iterator over the full, unsharded model parameters, optionally filtered and customized according to `aoa_config`.
         """
 
-        from paddle.distributed.flex_checkpoint.dcp.full_param import (
+        from paddle.distributed.flex_checkpoint.dcp.full_param_order import (
             full_param,
         )
 
-        return full_param(self, aoa_config, process_group)
+        return full_param(self.sharded_state_dict(), aoa_config, **kwargs)
 
     @framework.deprecate_stat_dict
     def set_state_dict(
